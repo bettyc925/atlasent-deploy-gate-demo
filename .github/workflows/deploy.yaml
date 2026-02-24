@@ -1,1 +1,129 @@
+name: Deploy (AtlaSent Gate)
 
+on:
+  push:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute artifact fingerprint
+        id: fp
+        run: |
+          echo "artifact_hash=${GITHUB_SHA}" >> $GITHUB_OUTPUT
+
+      - name: Evaluate with AtlaSent
+        id: eval
+        env:
+          ATLASENT_BASE_URL: ${{ secrets.ATLASENT_BASE_URL }}
+          ATLASENT_API_KEY: ${{ secrets.ATLASENT_API_KEY }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          ATLASENT_EVALUATE_PATH: ${{ secrets.ATLASENT_EVALUATE_PATH }}
+          ENV_NAME: "test"
+          ARTIFACT_HASH: ${{ steps.fp.outputs.artifact_hash }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ATLASENT_BASE_URL:-}" ] || [ -z "${ATLASENT_API_KEY:-}" ] || [ -z "${SUPABASE_ANON_KEY:-}" ]; then
+            echo "Missing one of: ATLASENT_BASE_URL, ATLASENT_API_KEY, SUPABASE_ANON_KEY"
+            exit 1
+          fi
+
+          EVAL_PATH="${ATLASENT_EVALUATE_PATH:-/v1-evaluate}"
+
+          echo "Calling AtlaSent ${EVAL_PATH} ..."
+
+          RESPONSE=$(curl -sS -X POST "${ATLASENT_BASE_URL}${EVAL_PATH}" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${ATLASENT_API_KEY}" \
+            -H "apikey: ${SUPABASE_ANON_KEY}" \
+            -d "{
+              \"action_type\": \"deploy.production\",
+              \"actor_id\": \"github-actions\",
+              \"request_id\": \"gha-eval-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\",
+              \"context\": {
+                \"environment\": { \"name\": \"${ENV_NAME}\" },
+                \"artifact\": { \"hash\": \"${ARTIFACT_HASH}\", \"source\": \"github\" },
+                \"github\": {
+                  \"repo\": \"${GITHUB_REPOSITORY}\",
+                  \"ref\": \"${GITHUB_REF}\",
+                  \"sha\": \"${GITHUB_SHA}\",
+                  \"run_id\": \"${GITHUB_RUN_ID}\"
+                }
+              }
+            }")
+
+          echo "AtlaSent response: $RESPONSE"
+
+          DECISION=$(echo "$RESPONSE" | jq -r '.decision // empty')
+          PERMIT=$(echo "$RESPONSE" | jq -r '.permit_token // empty')
+
+          if [ -z "$DECISION" ]; then
+            echo "Missing decision in response. Failing."
+            exit 1
+          fi
+
+          echo "decision=$DECISION" >> $GITHUB_OUTPUT
+          echo "permit_token=$PERMIT" >> $GITHUB_OUTPUT
+
+          if [ "$DECISION" != "allow" ]; then
+            echo "Denied by AtlaSent. Stopping deploy."
+            exit 1
+          fi
+
+          if [ -z "$PERMIT" ]; then
+            echo "Allowed but missing permit_token. Failing."
+            exit 1
+          fi
+
+      - name: Verify permit (execution-time gate)
+        env:
+          ATLASENT_BASE_URL: ${{ secrets.ATLASENT_BASE_URL }}
+          ATLASENT_API_KEY: ${{ secrets.ATLASENT_API_KEY }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          ATLASENT_VERIFY_PATH: ${{ secrets.ATLASENT_VERIFY_PATH }}
+          ENV_NAME: "test"
+          ARTIFACT_HASH: ${{ steps.fp.outputs.artifact_hash }}
+          PERMIT_TOKEN: ${{ steps.eval.outputs.permit_token }}
+        run: |
+          set -euo pipefail
+
+          VERIFY_PATH="${ATLASENT_VERIFY_PATH:-/v1-verify-permit}"
+
+          echo "Calling AtlaSent ${VERIFY_PATH} ..."
+
+          VERIFY_RESPONSE=$(curl -sS -X POST "${ATLASENT_BASE_URL}${VERIFY_PATH}" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${ATLASENT_API_KEY}" \
+            -H "apikey: ${SUPABASE_ANON_KEY}" \
+            -d "{
+              \"permit_token\": \"${PERMIT_TOKEN}\",
+              \"action_type\": \"deploy.production\",
+              \"actor_id\": \"github-actions\",
+              \"request_id\": \"gha-verify-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\",
+              \"context\": {
+                \"environment\": { \"name\": \"${ENV_NAME}\" },
+                \"artifact\": { \"hash\": \"${ARTIFACT_HASH}\", \"source\": \"github\" }
+              }
+            }")
+
+          echo "Verify response: $VERIFY_RESPONSE"
+
+          OUTCOME=$(echo "$VERIFY_RESPONSE" | jq -r '.outcome // empty')
+          if [ "$OUTCOME" != "allow" ]; then
+            echo "Permit verification failed (outcome=$OUTCOME). Blocking deploy."
+            exit 1
+          fi
+
+      - name: Deploy (placeholder)
+        run: |
+          echo "✅ Deploy would run now."
+          echo "Artifact: ${{ steps.fp.outputs.artifact_hash }}"
