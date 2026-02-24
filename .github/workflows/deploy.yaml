@@ -13,37 +13,102 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Compute artifact fingerprint
+        id: fp
+        run: |
+          # Demo binding: use commit SHA as "artifact hash"
+          echo "artifact_hash=${GITHUB_SHA}" >> $GITHUB_OUTPUT
+
       - name: Evaluate with AtlaSent
+        id: eval
         env:
           ATLASENT_BASE_URL: ${{ secrets.ATLASENT_BASE_URL }}
           ATLASENT_API_KEY: ${{ secrets.ATLASENT_API_KEY }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          ARTIFACT_HASH: ${{ steps.fp.outputs.artifact_hash }}
         run: |
-          set -e
+          set -euo pipefail
 
-          RESPONSE=$(curl -s -X POST "${ATLASENT_BASE_URL}/v1-evaluate" \
+          RESPONSE=$(curl -sS -X POST "${ATLASENT_BASE_URL}/v1-evaluate" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer ${ATLASENT_API_KEY}" \
             -H "apikey: ${SUPABASE_ANON_KEY}" \
             -d "{
               \"action_type\": \"production.deploy\",
               \"actor_id\": \"agent:ci\",
-              \"request_id\": \"gha-${GITHUB_RUN_ID}\",
+              \"request_id\": \"gha-eval-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\",
               \"context\": {
                 \"environment\": \"test\",
                 \"approvals\": 2,
-                \"change_window\": true
+                \"change_window\": true,
+                \"artifact_hash\": \"${ARTIFACT_HASH}\"
               }
             }")
 
-          echo "Response: $RESPONSE"
+          echo "Evaluate response: $RESPONSE"
 
-          DECISION=$(echo "$RESPONSE" | jq -r '.decision')
+          DECISION=$(echo "$RESPONSE" | jq -r '.decision // empty')
+          PERMIT_TOKEN=$(echo "$RESPONSE" | jq -r '.permit_token // empty')
+
+          if [ -z "$DECISION" ]; then
+            echo "Missing decision in evaluate response"
+            exit 1
+          fi
 
           if [ "$DECISION" != "allow" ]; then
-            echo "Deploy denied"
+            echo "Denied by AtlaSent evaluate (decision=$DECISION)"
+            exit 1
+          fi
+
+          if [ -z "$PERMIT_TOKEN" ] || [ "$PERMIT_TOKEN" = "null" ]; then
+            echo "Allowed but missing permit_token"
+            exit 1
+          fi
+
+          echo "permit_token=$PERMIT_TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Verify permit (execution-time enforcement)
+        id: verify
+        env:
+          ATLASENT_BASE_URL: ${{ secrets.ATLASENT_BASE_URL }}
+          ATLASENT_API_KEY: ${{ secrets.ATLASENT_API_KEY }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          ARTIFACT_HASH: ${{ steps.fp.outputs.artifact_hash }}
+          PERMIT_TOKEN: ${{ steps.eval.outputs.permit_token }}
+        run: |
+          set -euo pipefail
+
+          VERIFY_RESPONSE=$(curl -sS -X POST "${ATLASENT_BASE_URL}/v1-verify-permit" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${ATLASENT_API_KEY}" \
+            -H "apikey: ${SUPABASE_ANON_KEY}" \
+            -d "{
+              \"permit_token\": \"${PERMIT_TOKEN}\",
+              \"action_type\": \"production.deploy\",
+              \"actor_id\": \"agent:ci\",
+              \"request_id\": \"gha-verify-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\",
+              \"context\": {
+                \"environment\": \"test\",
+                \"artifact_hash\": \"${ARTIFACT_HASH}\"
+              }
+            }")
+
+          echo "Verify response: $VERIFY_RESPONSE"
+
+          OUTCOME=$(echo "$VERIFY_RESPONSE" | jq -r '.outcome // empty')
+
+          if [ -z "$OUTCOME" ]; then
+            echo "Missing outcome in verify response"
+            exit 1
+          fi
+
+          if [ "$OUTCOME" != "allow" ]; then
+            echo "Permit verification failed (outcome=$OUTCOME)"
             exit 1
           fi
 
       - name: Deploy (placeholder)
-        run: echo "Deploy would run here"
+        run: |
+          echo "✅ Deploy would run now"
+          echo "Commit: $GITHUB_SHA"
+          echo "Artifact hash: ${{ steps.fp.outputs.artifact_hash }}"
