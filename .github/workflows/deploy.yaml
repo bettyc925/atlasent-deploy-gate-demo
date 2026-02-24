@@ -26,7 +26,7 @@ jobs:
             -H "Authorization: Bearer ${ATLASENT_API_KEY}" \
             -H "apikey: ${SUPABASE_ANON_KEY}" \
             -d "{
-              \"action_type\": \"production.deploy\",
+              \"action_type\": \".deploy\",
               \"actor_id\": \"agent:ci\",
               \"request_id\": \"gha-${GITHUB_RUN_ID}\",
               \"context\": {
