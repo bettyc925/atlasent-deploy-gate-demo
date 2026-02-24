@@ -13,12 +13,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Compute artifact fingerprint
-        id: fp
-        run: echo "artifact_hash=${GITHUB_SHA}" >> $GITHUB_OUTPUT
-
       - name: Evaluate with AtlaSent
-        id: eval
         env:
           ATLASENT_BASE_URL: ${{ secrets.ATLASENT_BASE_URL }}
           ATLASENT_API_KEY: ${{ secrets.ATLASENT_API_KEY }}
@@ -31,12 +26,13 @@ jobs:
             -H "Authorization: Bearer ${ATLASENT_API_KEY}" \
             -H "apikey: ${SUPABASE_ANON_KEY}" \
             -d "{
-              \"action_type\": \"deploy.production\",
-              \"actor_id\": \"github-actions\",
+              \"action_type\": \"production.deploy\",
+              \"actor_id\": \"agent:ci\",
               \"request_id\": \"gha-${GITHUB_RUN_ID}\",
               \"context\": {
-                \"environment\": { \"name\": \"test\" },
-                \"artifact\": { \"hash\": \"${GITHUB_SHA}\" }
+                \"environment\": \"test\",
+                \"approvals\": 2,
+                \"change_window\": true
               }
             }")
 
