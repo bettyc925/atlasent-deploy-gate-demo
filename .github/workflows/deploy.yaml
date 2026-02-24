@@ -6,7 +6,48 @@ on:
       - main
 
 jobs:
-  sanity:
+  deploy:
     runs-on: ubuntu-latest
+
     steps:
-      - run: echo "workflow trigger ok"
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute artifact fingerprint
+        id: fp
+        run: echo "artifact_hash=${GITHUB_SHA}" >> $GITHUB_OUTPUT
+
+      - name: Evaluate with AtlaSent
+        id: eval
+        env:
+          ATLASENT_BASE_URL: ${{ secrets.ATLASENT_BASE_URL }}
+          ATLASENT_API_KEY: ${{ secrets.ATLASENT_API_KEY }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          set -e
+
+          RESPONSE=$(curl -s -X POST "${ATLASENT_BASE_URL}/v1-evaluate" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${ATLASENT_API_KEY}" \
+            -H "apikey: ${SUPABASE_ANON_KEY}" \
+            -d "{
+              \"action_type\": \"deploy.production\",
+              \"actor_id\": \"github-actions\",
+              \"request_id\": \"gha-${GITHUB_RUN_ID}\",
+              \"context\": {
+                \"environment\": { \"name\": \"test\" },
+                \"artifact\": { \"hash\": \"${GITHUB_SHA}\" }
+              }
+            }")
+
+          echo "Response: $RESPONSE"
+
+          DECISION=$(echo "$RESPONSE" | jq -r '.decision')
+
+          if [ "$DECISION" != "allow" ]; then
+            echo "Deploy denied"
+            exit 1
+          fi
+
+      - name: Deploy (placeholder)
+        run: echo "Deploy would run here"
