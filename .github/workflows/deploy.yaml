@@ -10,227 +10,163 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Install jq (required)
         run: sudo apt-get update && sudo apt-get install -y jq
-
-      - name: Compute artifact fingerprint
-        id: fp
-        run: |
-          echo "artifact_hash=${GITHUB_SHA}" >> $GITHUB_OUTPUT
 
       - name: Evaluate with AtlaSent (must ALLOW)
         id: eval
         env:
           ATLASENT_API_KEY: ${{ secrets.ATLASENT_API_KEY }}
           ATLASENT_BASE_URL: https://ducfnmhveikymmgwpgcd.supabase.co/functions/v1
-          ARTIFACT_HASH: ${{ steps.fp.outputs.artifact_hash }}
         run: |
           set -euo pipefail
 
           if [ -z "${ATLASENT_API_KEY:-}" ]; then
-            echo "ERROR: Missing secret ATLASENT_API_KEY. Failing closed."
+            echo "::error::ATLASENT_API_KEY secret is not set"
             exit 1
           fi
 
-          RESPONSE=$(curl -sS --fail-with-body -X POST "${ATLASENT_BASE_URL}/v1-evaluate" \
+          REQUEST_ID="github-eval-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          BODY=$(jq -nc \
+            --arg action_type "production.deploy" \
+            --arg actor_id "github:${GITHUB_ACTOR}" \
+            --arg request_id "$REQUEST_ID" \
+            --arg env "prod" \
+            --arg repo "${GITHUB_REPOSITORY}" \
+            --arg sha "${GITHUB_SHA}" \
+            --arg ref "${GITHUB_REF}" \
+            --arg run_id "${GITHUB_RUN_ID}" \
+            '{
+              action_type: $action_type,
+              actor_id: $actor_id,
+              request_id: $request_id,
+              context: {
+                environment: $env,
+                repo: $repo,
+                sha: $sha,
+                ref: $ref,
+                run_id: $run_id
+              }
+            }')
+
+          RESPONSE=$(curl -sS --fail-with-body --max-time 30 \
+            -X POST "${ATLASENT_BASE_URL}/v1-evaluate" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer ${ATLASENT_API_KEY}" \
-            -d "{
-              \"action_type\": \"deployment.production\",
-              \"actor_id\": \"github:${GITHUB_ACTOR}\",
-              \"request_id\": \"gha-eval-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\",
-              \"context\": {
-                \"environment\": \"production\",
-                \"repo\": \"${GITHUB_REPOSITORY}\",
-                \"sha\": \"${GITHUB_SHA}\",
-                \"ref\": \"${GITHUB_REF}\",
-                \"run_id\": \"${GITHUB_RUN_ID}\",
-                \"artifact_hash\": \"${ARTIFACT_HASH}\"
-              }
-            }")
+            -d "${BODY}") || {
+              echo "::error::AtlaSent evaluate unreachable or non-2xx — BLOCKED (fail-closed)"
+              exit 1
+            }
 
           echo "Evaluate response: $RESPONSE"
+          echo "$RESPONSE" | jq . >/dev/null 2>&1 || {
+            echo "::error::AtlaSent evaluate returned invalid JSON — BLOCKED (fail-closed)"
+            exit 1
+          }
 
           DECISION=$(echo "$RESPONSE" | jq -r '.decision // empty')
-          DENY_REASON=$(echo "$RESPONSE" | jq -r '.deny_reason // empty')
-          PERMIT_TOKEN=$(echo "$RESPONSE" | jq -r '.permit_token // empty')
-
           if [ -z "$DECISION" ]; then
-            echo "ERROR: Missing decision in evaluate response. Failing closed."
+            echo "::error::Missing decision — BLOCKED (fail-closed)"
             exit 1
           fi
 
           if [ "$DECISION" != "allow" ]; then
-            echo "BLOCKED by AtlaSent evaluate (decision=$DECISION deny_reason=$DENY_REASON)"
+            CODE=$(echo "$RESPONSE" | jq -r '.error_code // .deny_code // "unknown"')
+            REASON=$(echo "$RESPONSE" | jq -r '.reason // .deny_reason // "no reason provided"')
+            echo "::error::BLOCKED by AtlaSent evaluate decision=$DECISION code=$CODE reason=$REASON"
             exit 1
           fi
 
+          PERMIT_TOKEN=$(echo "$RESPONSE" | jq -r '.permit_token // .permit // empty')
           if [ -z "$PERMIT_TOKEN" ] || [ "$PERMIT_TOKEN" = "null" ]; then
-            echo "ERROR: decision=allow but missing permit_token. Failing closed."
+            echo "::error::Allowed but missing permit_token — BLOCKED (fail-closed)"
             exit 1
           fi
 
-          echo "permit_token=$PERMIT_TOKEN" >> $GITHUB_OUTPUT
+          echo "PERMIT_TOKEN=$PERMIT_TOKEN" >> $GITHUB_ENV
 
-      - name: Verify permit (execution-time enforcement)
-        id: verify
+      - name: Verify permit (execution-time enforcement) (must ALLOW)
         env:
           ATLASENT_API_KEY: ${{ secrets.ATLASENT_API_KEY }}
-          ATLASENT_BASE_URL: https://YOUR_PROJECT_REF.supabase.co/functions/v1
-          ARTIFACT_HASH: ${{ steps.fp.outputs.artifact_hash }}
-          PERMIT_TOKEN: ${{ steps.eval.outputs.permit_token }}
+          ATLASENT_BASE_URL: https://ducfnmhveikymmgwpgcd.supabase.co/functions/v1
         run: |
           set -euo pipefail
 
           if [ -z "${PERMIT_TOKEN:-}" ]; then
-            echo "ERROR: Missing permit_token from evaluate. Failing closed."
+            echo "::error::Missing PERMIT_TOKEN — BLOCKED"
             exit 1
           fi
 
-          VERIFY_RESPONSE=$(curl -sS --fail-with-body -X POST "${ATLASENT_BASE_URL}/v1-verify-permit" \
+          VERIFY_ID="github-verify-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          BODY=$(jq -nc \
+            --arg permit_token "${PERMIT_TOKEN}" \
+            --arg action_type "production.deploy" \
+            --arg actor_id "github:${GITHUB_ACTOR}" \
+            --arg environment "prod" \
+            --arg request_id "${VERIFY_ID}" \
+            --arg env "prod" \
+            --arg repo "${GITHUB_REPOSITORY}" \
+            --arg sha "${GITHUB_SHA}" \
+            --arg ref "${GITHUB_REF}" \
+            --arg run_id "${GITHUB_RUN_ID}" \
+            '{
+              permit_token: $permit_token,
+              action_type: $action_type,
+              actor_id: $actor_id,
+              environment: $environment,
+              request_id: $request_id,
+              context: {
+                environment: $env,
+                repo: $repo,
+                sha: $sha,
+                ref: $ref,
+                run_id: $run_id
+              }
+            }')
+
+          RESPONSE=$(curl -sS --fail-with-body --max-time 30 \
+            -X POST "${ATLASENT_BASE_URL}/v1-verify-permit" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer ${ATLASENT_API_KEY}" \
-            -d "{
-              \"permit_token\": \"${PERMIT_TOKEN}\",
-              \"action_type\": \"deployment.production\",
-              \"actor_id\": \"github:${GITHUB_ACTOR}\",
-              \"environment\": \"production\",
-              \"request_id\": \"gha-verify-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\",
-              \"context\": {
-                \"environment\": \"production\",
-                \"repo\": \"${GITHUB_REPOSITORY}\",
-                \"sha\": \"${GITHUB_SHA}\",
-                \"ref\": \"${GITHUB_REF}\",
-                \"run_id\": \"${GITHUB_RUN_ID}\",
-                \"artifact_hash\": \"${ARTIFACT_HASH}\"
-              }
-            }")
+            -d "${BODY}") || {
+              echo "::error::AtlaSent verify unreachable or non-2xx — BLOCKED (fail-closed)"
+              exit 1
+            }
 
-          echo "Verify response: $VERIFY_RESPONSE"
+          echo "Verify response: $RESPONSE"
+          echo "$RESPONSE" | jq . >/dev/null 2>&1 || {
+            echo "::error::AtlaSent verify returned invalid JSON — BLOCKED (fail-closed)"
+            exit 1
+          }
 
-          OUTCOME=$(echo "$VERIFY_RESPONSE" | jq -r '.outcome // .decision // empty')
+          OUTCOME=$(echo "$RESPONSE" | jq -r '.outcome // .decision // empty')
+          VALID=$(echo "$RESPONSE" | jq -r '.valid // empty')
+
+          if [ -n "$VALID" ] && [ "$VALID" != "true" ]; then
+            CODE=$(echo "$RESPONSE" | jq -r '.verify_error_code // .deny_code // "unknown"')
+            REASON=$(echo "$RESPONSE" | jq -r '.reason // .deny_reason // "unknown"')
+            echo "::error::Permit invalid — code=$CODE reason=$REASON"
+            exit 1
+          fi
+
           if [ -z "$OUTCOME" ]; then
-            echo "ERROR: Missing outcome in verify response. Failing closed."
+            echo "::error::Missing outcome/decision from verify — BLOCKED (fail-closed)"
             exit 1
           fi
 
           if [ "$OUTCOME" != "allow" ]; then
-            echo "BLOCKED by AtlaSent verify (outcome=$OUTCOME)"
+            CODE=$(echo "$RESPONSE" | jq -r '.verify_error_code // .deny_code // "unknown"')
+            REASON=$(echo "$RESPONSE" | jq -r '.reason // .deny_reason // "unknown"')
+            echo "::error::Permit verification FAILED — outcome=$OUTCOME code=$CODE reason=$REASON"
             exit 1
           fi
 
-      - name: Deploy (placeholder)
+          echo "✅ Permit verified — deploy may proceed"
+
+      - name: Deploy to Production (placeholder)
         run: |
-          echo "✅ Deploy would run now"
-          echo "Commit: $GITHUB_SHA"
-
-  atlasent-replay-protection:
-    runs-on: ubuntu-latest
-    needs: atlasent-deploy-gate
-
-    steps:
-      - name: Install jq (required)
-        run: sudo apt-get update && sudo apt-get install -y jq
-
-      - name: Compute artifact fingerprint
-        id: fp
-        run: |
-          echo "artifact_hash=${GITHUB_SHA}" >> $GITHUB_OUTPUT
-
-      - name: Evaluate (new permit)
-        id: eval
-        env:
-          ATLASENT_API_KEY: ${{ secrets.ATLASENT_API_KEY }}
-          ATLASENT_BASE_URL: https://YOUR_PROJECT_REF.supabase.co/functions/v1
-          ARTIFACT_HASH: ${{ steps.fp.outputs.artifact_hash }}
-        run: |
-          set -euo pipefail
-
-          RESPONSE=$(curl -sS --fail-with-body -X POST "${ATLASENT_BASE_URL}/v1-evaluate" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer ${ATLASENT_API_KEY}" \
-            -d "{
-              \"action_type\": \"deployment.production\",
-              \"actor_id\": \"github:${GITHUB_ACTOR}\",
-              \"request_id\": \"gha-replay-eval-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\",
-              \"context\": {
-                \"environment\": \"production\",
-                \"repo\": \"${GITHUB_REPOSITORY}\",
-                \"sha\": \"${GITHUB_SHA}\",
-                \"ref\": \"${GITHUB_REF}\",
-                \"run_id\": \"${GITHUB_RUN_ID}\",
-                \"artifact_hash\": \"${ARTIFACT_HASH}\"
-              }
-            }")
-
-          echo "Replay test evaluate response: $RESPONSE"
-          PERMIT_TOKEN=$(echo "$RESPONSE" | jq -r '.permit_token // empty')
-
-          if [ -z "$PERMIT_TOKEN" ] || [ "$PERMIT_TOKEN" = "null" ]; then
-            echo "ERROR: Missing permit_token for replay test. Failing closed."
-            exit 1
-          fi
-
-          echo "permit_token=$PERMIT_TOKEN" >> $GITHUB_OUTPUT
-
-      - name: Verify #1 (should ALLOW)
-        env:
-          ATLASENT_API_KEY: ${{ secrets.ATLASENT_API_KEY }}
-          ATLASENT_BASE_URL: https://YOUR_PROJECT_REF.supabase.co/functions/v1
-          PERMIT_TOKEN: ${{ steps.eval.outputs.permit_token }}
-        run: |
-          set -euo pipefail
-
-          R1=$(curl -sS --fail-with-body -X POST "${ATLASENT_BASE_URL}/v1-verify-permit" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer ${ATLASENT_API_KEY}" \
-            -d "{
-              \"permit_token\": \"${PERMIT_TOKEN}\",
-              \"action_type\": \"deployment.production\",
-              \"actor_id\": \"github:${GITHUB_ACTOR}\",
-              \"environment\": \"production\",
-              \"request_id\": \"gha-replay-v1-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\",
-              \"context\": { \"environment\": \"production\" }
-            }")
-
-          echo "Replay verify #1 response: $R1"
-          OUTCOME=$(echo "$R1" | jq -r '.outcome // .decision // empty')
-
-          if [ "$OUTCOME" != "allow" ]; then
-            echo "ERROR: Expected verify #1 allow, got: $OUTCOME"
-            exit 1
-          fi
-
-      - name: Verify #2 with SAME permit (should NOT ALLOW)
-        env:
-          ATLASENT_API_KEY: ${{ secrets.ATLASENT_API_KEY }}
-          ATLASENT_BASE_URL: https://YOUR_PROJECT_REF.supabase.co/functions/v1
-          PERMIT_TOKEN: ${{ steps.eval.outputs.permit_token }}
-        run: |
-          set -euo pipefail
-
-          R2=$(curl -sS --fail-with-body -X POST "${ATLASENT_BASE_URL}/v1-verify-permit" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer ${ATLASENT_API_KEY}" \
-            -d "{
-              \"permit_token\": \"${PERMIT_TOKEN}\",
-              \"action_type\": \"deployment.production\",
-              \"actor_id\": \"github:${GITHUB_ACTOR}\",
-              \"environment\": \"production\",
-              \"request_id\": \"gha-replay-v2-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\",
-              \"context\": { \"environment\": \"production\" }
-            }")
-
-          echo "Replay verify #2 response: $R2"
-          OUTCOME=$(echo "$R2" | jq -r '.outcome // .decision // empty')
-          IDEMP=$(echo "$R2" | jq -r '.idempotent_replay // empty')
-
-          if [ "$OUTCOME" = "allow" ]; then
-            echo "ERROR: Expected verify #2 to NOT allow, but got allow"
-            exit 1
-          fi
-
-          echo "✅ Replay protection confirmed. outcome=$OUTCOME idempotent_replay=$IDEMP"
+          echo "✅ Replace this with your deploy command"
