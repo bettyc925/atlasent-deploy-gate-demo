@@ -15,13 +15,20 @@ jobs:
       - name: Install jq (required)
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Evaluate with AtlaSent (must ALLOW)
+      - name: Evaluate with AtlaSent (DEBUG MODE)
         id: eval
         env:
           ATLASENT_API_KEY: ${{ secrets.ATLASENT_API_KEY }}
           ATLASENT_BASE_URL: https://ducfnmhveikymmgwpgcd.supabase.co/functions/v1
         run: |
           set -euo pipefail
+
+          echo "ATLASENT_BASE_URL=${ATLASENT_BASE_URL}"
+
+          if [ -z "${ATLASENT_API_KEY:-}" ]; then
+            echo "::error::ATLASENT_API_KEY secret is not set"
+            exit 1
+          fi
 
           REQUEST_ID="github-eval-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
@@ -51,23 +58,37 @@ jobs:
               }
             }')
 
-          RESPONSE=$(curl -sS --fail-with-body --max-time 30 \
+          echo "---- Evaluate request body ----"
+          echo "$BODY" | jq .
+          echo "--------------------------------"
+
+          RESPONSE=$(curl -sS -i --max-time 30 \
             -X POST "${ATLASENT_BASE_URL}/v1-evaluate" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer ${ATLASENT_API_KEY}" \
             -d "${BODY}")
 
-          echo "Evaluate response: $RESPONSE"
+          echo "---- Evaluate raw response ----"
+          echo "$RESPONSE"
+          echo "--------------------------------"
 
-          DECISION=$(echo "$RESPONSE" | jq -r '.decision // empty')
+          HTTP_CODE=$(echo "$RESPONSE" | head -n 1 | awk '{print $2}')
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Evaluate returned HTTP $HTTP_CODE — BLOCKED (fail-closed)"
+            exit 1
+          fi
+
+          JSON=$(echo "$RESPONSE" | awk 'BEGIN{h=1} /^\r?$/{h=0; next} {if(!h) print}')
+
+          DECISION=$(echo "$JSON" | jq -r '.decision // empty')
           if [ "$DECISION" != "allow" ]; then
-            CODE=$(echo "$RESPONSE" | jq -r '.error_code // .deny_code // "unknown"')
-            REASON=$(echo "$RESPONSE" | jq -r '.reason // .deny_reason // "no reason provided"')
+            CODE=$(echo "$JSON" | jq -r '.error_code // .deny_code // "unknown"')
+            REASON=$(echo "$JSON" | jq -r '.reason // .deny_reason // "no reason provided"')
             echo "::error::BLOCKED by AtlaSent evaluate decision=$DECISION code=$CODE reason=$REASON"
             exit 1
           fi
 
-          PERMIT_TOKEN=$(echo "$RESPONSE" | jq -r '.permit_token // .permit // empty')
+          PERMIT_TOKEN=$(echo "$JSON" | jq -r '.permit_token // .permit // empty')
           if [ -z "$PERMIT_TOKEN" ] || [ "$PERMIT_TOKEN" = "null" ]; then
             echo "::error::Allowed but missing permit_token — BLOCKED"
             exit 1
@@ -75,7 +96,7 @@ jobs:
 
           echo "PERMIT_TOKEN=$PERMIT_TOKEN" >> $GITHUB_ENV
 
-      - name: Verify permit (execution-time enforcement) (must ALLOW)
+      - name: Verify permit (DEBUG MODE)
         env:
           ATLASENT_API_KEY: ${{ secrets.ATLASENT_API_KEY }}
           ATLASENT_BASE_URL: https://ducfnmhveikymmgwpgcd.supabase.co/functions/v1
@@ -114,18 +135,32 @@ jobs:
               }
             }')
 
-          RESPONSE=$(curl -sS --fail-with-body --max-time 30 \
+          echo "---- Verify request body ----"
+          echo "$BODY" | jq .
+          echo "------------------------------"
+
+          RESPONSE=$(curl -sS -i --max-time 30 \
             -X POST "${ATLASENT_BASE_URL}/v1-verify-permit" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer ${ATLASENT_API_KEY}" \
             -d "${BODY}")
 
-          echo "Verify response: $RESPONSE"
+          echo "---- Verify raw response ----"
+          echo "$RESPONSE"
+          echo "--------------------------------"
 
-          OUTCOME=$(echo "$RESPONSE" | jq -r '.outcome // .decision // empty')
-          if [ -z "$OUTCOME" ] || [ "$OUTCOME" != "allow" ]; then
-            CODE=$(echo "$RESPONSE" | jq -r '.verify_error_code // .deny_code // "unknown"')
-            REASON=$(echo "$RESPONSE" | jq -r '.reason // .deny_reason // "unknown"')
+          HTTP_CODE=$(echo "$RESPONSE" | head -n 1 | awk '{print $2}')
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Verify returned HTTP $HTTP_CODE — BLOCKED (fail-closed)"
+            exit 1
+          fi
+
+          JSON=$(echo "$RESPONSE" | awk 'BEGIN{h=1} /^\r?$/{h=0; next} {if(!h) print}')
+
+          OUTCOME=$(echo "$JSON" | jq -r '.outcome // .decision // empty')
+          if [ "$OUTCOME" != "allow" ]; then
+            CODE=$(echo "$JSON" | jq -r '.verify_error_code // .deny_code // "unknown"')
+            REASON=$(echo "$JSON" | jq -r '.reason // .deny_reason // "unknown"')
             echo "::error::Permit verification FAILED outcome=$OUTCOME code=$CODE reason=$REASON"
             exit 1
           fi
@@ -133,4 +168,5 @@ jobs:
           echo "✅ Permit verified — deploy may proceed"
 
       - name: Deploy to Production (placeholder)
-        run: echo "✅ Replace with your deploy command"
+        run: |
+          echo "Replace this with your real deploy command"
