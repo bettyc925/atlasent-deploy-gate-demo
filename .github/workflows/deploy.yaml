@@ -25,7 +25,7 @@ jobs:
         id: eval
         env:
           ATLASENT_API_KEY: ${{ secrets.ATLASENT_API_KEY }}
-          ATLASENT_BASE_URL: https://YOUR_PROJECT_REF.supabase.co/functions/v1
+          ATLASENT_BASE_URL: https://ducfnmhveikymmgwpgcd.supabase.co/functions/v1
           ARTIFACT_HASH: ${{ steps.fp.outputs.artifact_hash }}
         run: |
           set -euo pipefail
