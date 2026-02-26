@@ -5,6 +5,16 @@ on:
     branches: [main]
   workflow_dispatch: {}
 
+env:
+  # OLD backend (Lovable-managed) — still gates
+  ATLASENT_PRIMARY_BASE_URL: https://ducfnmhveikymmgwpgcd.supabase.co/functions/v1
+
+  # NEW backend (your Supabase)
+  ATLASENT_SHADOW_BASE_URL: https://ckbcjcxeiswlubvzzhjf.supabase.co/functions/v1
+
+  # Public anon key from GitHub Variable
+  ATLASENT_ANON_KEY: ${{ vars.ATLASENT_ANON_KEY }}
+
 jobs:
   atlasent-deploy-gate:
     runs-on: ubuntu-latest
@@ -15,22 +25,11 @@ jobs:
       - name: Install jq (required)
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Evaluate with AtlaSent (DEBUG MODE)
-        id: eval
-        env:
-          ATLASENT_API_KEY: ${{ secrets.ATLASENT_API_KEY }}
-          ATLASENT_BASE_URL: https://ducfnmhveikymmgwpgcd.supabase.co/functions/v1
+      - name: Build canonical payload
+        id: payload
         run: |
           set -euo pipefail
-
-          echo "ATLASENT_BASE_URL=${ATLASENT_BASE_URL}"
-
-          if [ -z "${ATLASENT_API_KEY:-}" ]; then
-            echo "::error::ATLASENT_API_KEY secret is not set"
-            exit 1
-          fi
-
-          REQUEST_ID="github-eval-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          REQUEST_ID="github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
           BODY=$(jq -nc \
             --arg action_type "production.deploy" \
@@ -58,56 +57,68 @@ jobs:
               }
             }')
 
-          echo "---- Evaluate request body ----"
-          echo "$BODY" | jq .
-          echo "--------------------------------"
+          echo "request_id=$REQUEST_ID" >> $GITHUB_OUTPUT
+          echo "body=$BODY" >> $GITHUB_OUTPUT
 
-          RESPONSE=$(curl -sS -i --max-time 30 \
-            -X POST "${ATLASENT_BASE_URL}/v1-evaluate" \
+      # -------------------------
+      # PRIMARY (GATING) CALL
+      # -------------------------
+      - name: Evaluate (PRIMARY — gates)
+        id: primary_eval
+        env:
+          ATLASENT_API_KEY: ${{ secrets.ATLASENT_API_KEY }}
+          BODY: ${{ steps.payload.outputs.body }}
+        run: |
+          set -euo pipefail
+          : "${ATLASENT_API_KEY:?Missing secret ATLASENT_API_KEY}"
+          : "${ATLASENT_ANON_KEY:?Missing variable ATLASENT_ANON_KEY}"
+
+          RESP=$(curl -sS -i --max-time 30 \
+            -X POST "${ATLASENT_PRIMARY_BASE_URL}/v1-evaluate" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer ${ATLASENT_API_KEY}" \
+            -H "apikey: ${ATLASENT_ANON_KEY}" \
             -d "${BODY}")
 
-          echo "---- Evaluate raw response ----"
-          echo "$RESPONSE"
-          echo "--------------------------------"
+          echo "---- PRIMARY EVAL RAW ----"
+          echo "$RESP"
+          echo "--------------------------"
 
-          HTTP_CODE=$(echo "$RESPONSE" | head -n 1 | awk '{print $2}')
+          HTTP_CODE=$(echo "$RESP" | head -n 1 | awk '{print $2}')
           if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ] && [ "$HTTP_CODE" != "204" ]; then
-            echo "::error::Evaluate returned HTTP $HTTP_CODE — BLOCKED (fail-closed)"
+            echo "::error::PRIMARY evaluate HTTP $HTTP_CODE — BLOCKED (fail-closed)"
             exit 1
           fi
 
-          JSON=$(echo "$RESPONSE" | awk 'BEGIN{h=1} /^\r?$/{h=0; next} {if(!h) print}')
-
+          JSON=$(echo "$RESP" | awk 'BEGIN{h=1} /^\r?$/{h=0; next} {if(!h) print}')
           DECISION=$(echo "$JSON" | jq -r '.decision // empty')
+
           if [ "$DECISION" != "allow" ]; then
             CODE=$(echo "$JSON" | jq -r '.error_code // .deny_code // "unknown"')
             REASON=$(echo "$JSON" | jq -r '.reason // .deny_reason // "no reason provided"')
-            echo "::error::BLOCKED by AtlaSent evaluate decision=$DECISION code=$CODE reason=$REASON"
+            echo "::error::PRIMARY blocked decision=$DECISION code=$CODE reason=$REASON"
             exit 1
           fi
 
           PERMIT_TOKEN=$(echo "$JSON" | jq -r '.permit_token // .permit // empty')
           if [ -z "$PERMIT_TOKEN" ] || [ "$PERMIT_TOKEN" = "null" ]; then
-            echo "::error::Allowed but missing permit_token — BLOCKED"
+            echo "::error::PRIMARY allow but missing permit_token — BLOCKED"
             exit 1
           fi
 
-          echo "PERMIT_TOKEN=$PERMIT_TOKEN" >> $GITHUB_ENV
+          echo "permit_token=$PERMIT_TOKEN" >> $GITHUB_OUTPUT
 
-      - name: Verify permit (DEBUG MODE)
+      - name: Verify Permit (PRIMARY — gates)
         env:
           ATLASENT_API_KEY: ${{ secrets.ATLASENT_API_KEY }}
-          ATLASENT_BASE_URL: https://ducfnmhveikymmgwpgcd.supabase.co/functions/v1
+          PERMIT_TOKEN: ${{ steps.primary_eval.outputs.permit_token }}
+          REQUEST_ID: ${{ steps.payload.outputs.request_id }}
         run: |
           set -euo pipefail
+          : "${ATLASENT_API_KEY:?Missing secret ATLASENT_API_KEY}"
+          : "${ATLASENT_ANON_KEY:?Missing variable ATLASENT_ANON_KEY}"
 
-          if [ -z "${PERMIT_TOKEN:-}" ]; then
-            echo "::error::Missing PERMIT_TOKEN from evaluate step — deploy BLOCKED"
-            exit 1
-          fi
-          VERIFY_ID="github-verify-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          VERIFY_ID="verify-${REQUEST_ID}"
 
           BODY=$(jq -nc \
             --arg permit_token "${PERMIT_TOKEN}" \
@@ -139,38 +150,55 @@ jobs:
               }
             }')
 
-          echo "---- Verify request body ----"
-          echo "$BODY" | jq .
-          echo "------------------------------"
-
-          RESPONSE=$(curl -sS -i --max-time 30 \
-            -X POST "${ATLASENT_BASE_URL}/v1-verify-permit" \
+          RESP=$(curl -sS -i --max-time 30 \
+            -X POST "${ATLASENT_PRIMARY_BASE_URL}/v1-verify-permit" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer ${ATLASENT_API_KEY}" \
+            -H "apikey: ${ATLASENT_ANON_KEY}" \
             -d "${BODY}")
 
-          echo "---- Verify raw response ----"
-          echo "$RESPONSE"
-          echo "--------------------------------"
+          echo "---- PRIMARY VERIFY RAW ----"
+          echo "$RESP"
+          echo "----------------------------"
 
-          HTTP_CODE=$(echo "$RESPONSE" | head -n 1 | awk '{print $2}')
+          HTTP_CODE=$(echo "$RESP" | head -n 1 | awk '{print $2}')
           if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ] && [ "$HTTP_CODE" != "204" ]; then
-            echo "::error::Verify returned HTTP $HTTP_CODE — BLOCKED (fail-closed)"
+            echo "::error::PRIMARY verify HTTP $HTTP_CODE — BLOCKED (fail-closed)"
             exit 1
           fi
 
-          JSON=$(echo "$RESPONSE" | awk 'BEGIN{h=1} /^\r?$/{h=0; next} {if(!h) print}')
-
+          JSON=$(echo "$RESP" | awk 'BEGIN{h=1} /^\r?$/{h=0; next} {if(!h) print}')
           OUTCOME=$(echo "$JSON" | jq -r '.outcome // .decision // empty')
+
           if [ "$OUTCOME" != "allow" ]; then
             CODE=$(echo "$JSON" | jq -r '.verify_error_code // .deny_code // "unknown"')
             REASON=$(echo "$JSON" | jq -r '.reason // .deny_reason // "unknown"')
-            echo "::error::Permit verification FAILED outcome=$OUTCOME code=$CODE reason=$REASON"
+            echo "::error::PRIMARY verify failed outcome=$OUTCOME code=$CODE reason=$REASON"
             exit 1
           fi
 
-          echo "✅ Permit verified — deploy may proceed"
+      # -------------------------
+      # SHADOW (NON-GATING) CALL
+      # -------------------------
+      - name: Evaluate (SHADOW — non-gating)
+        continue-on-error: true
+        env:
+          ATLASENT_API_KEY: ${{ secrets.ATLASENT_API_KEY }}
+          BODY: ${{ steps.payload.outputs.body }}
+        run: |
+          set -euo pipefail
+          : "${ATLASENT_ANON_KEY:?Missing variable ATLASENT_ANON_KEY}"
+
+          RESP=$(curl -sS -i --max-time 30 \
+            -X POST "${ATLASENT_SHADOW_BASE_URL}/v1-evaluate" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${ATLASENT_API_KEY}" \
+            -H "apikey: ${ATLASENT_ANON_KEY}" \
+            -d "${BODY}")
+
+          echo "---- SHADOW EVAL RAW ----"
+          echo "$RESP"
+          echo "-------------------------"
 
       - name: Deploy to Production (placeholder)
-        run: |
-          echo "Replace this with your real deploy command"
+        run: echo "✅ Replace this with your real deploy command"
